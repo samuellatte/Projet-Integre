@@ -1,0 +1,245 @@
+/*
+ * Main file of Projet_intégré_2.0.X
+ * Author: De Saulnier K. 
+ *         Latte S.
+ *
+ * 
+ */
+
+#include "xc.h"         // Contains register variable definitions
+#include "libpic30.h"   // Contains __delay_ms definition
+#define pi acos(-1.0)
+#define r 0.041
+#define a_max 0.50 // m par seconde²
+#define v_max = 0.50 // m par seconde
+#define kp 3.69 // [m^-1]
+#define E 0.134 // Empattement
+#define correct_transl 1 // 1.025
+#define correct_rot 1.1025
+#define FCY 3685000     // µcycle frequency. Needed for __delay_ms
+#define Period 183      // Period = FCY/20000 -1 donne la période du timer */
+
+
+
+
+void moteur_gauche(float dc);
+void moteur_droite(float dc);
+void regul(float* dc);
+//float regul_transl(int* ordre);
+float regul_rotat();
+float dc[2] = {0,0};
+float dc_rotat = 0;
+//float dc_transl = 0;
+int ordre = 0;
+int param = 0;
+int delay = 2000;
+   
+
+int main(void){
+    
+    frcPll40MHzConfig();
+    TRISBbits.TRISB8 = 0;
+    
+    // PWM pour la roue de gauche 
+    
+    OC1CONbits.OCM = 0b110; // Selectionner le mode PWM d'output compare
+    OC1CONbits.OCTSEL = 0; // On allume le timer2
+    _RP15R = 0b10010; // Sur quelle patte mettre quel OCR 
+    PR2 = Period;
+    T2CONbits.TON = 1;
+    TRISBbits.TRISB13 = 0;
+    
+    // PWM pour la roue de droite
+    
+    OC2CONbits.OCM = 0b110; // Selectionner le mode PWM d'output compare
+    OC2CONbits.OCTSEL = 0; // On allume le timer2
+    _RP3R = 0b10011; // Sur quelle patte mettre quel OCR 
+    TRISBbits.TRISB2 = 0;
+
+    // Encodeur en quadrature QEI pour la roue gauche 
+    
+    QEI1CONbits.QEIM = 0b111;
+    RPINR14bits.QEA1R = 6;
+    RPINR14bits.QEB1R = 7;
+    
+    // Encodeur en quadrature QEI pour la roue droite 
+    
+    QEI2CONbits.QEIM = 0b111;
+    RPINR16bits.QEA2R = 11;
+    RPINR16bits.QEB2R = 12;
+    
+    // Définition des RX et TX 
+    
+	_RP4R = 3;    // U1RX -> Transmission de RB6 vers RB5
+	_U1RXR = 5;     // U1TX -> Réception de RB5 vers RB7
+    
+    // Configuration de l'UART1 avec un format de trame 8N1, à 57600 bits/s
+    U1MODEbits.PDSEL = 0;       // 8 bits, pas de parité
+    U1MODEbits.STSEL = 0;       // 1 stop bit
+    /* L'UART peut fonctionner à 2 vitesses différentes. Le mode "high speed" 
+     * est plus sensible au bruit et ne doit donc être utilisé que pour
+     * des débits trop rapides pour le mode standard 
+     * En mode standard, le débit est donné par :
+     * baud rate = FCY / (16*(U1BRG+1))
+     * => U1BRG = (3.685MHz / (16*57.6kHz)) - 1  =  2.998*/
+    U1MODEbits.BRGH = 0;
+    U1BRG = 42.4;
+    
+    U1MODEbits.UARTEN = 1;      // on active l'UART
+    U1STAbits.UTXEN = 1;        // on active l'émission
+    
+    // Main (infinite) loop
+    /*while(1) {
+        if (ordre[0] == 0){
+            dc_transl = regul_transl(ordre);
+            //dc_rot = regul_rotat(ordre);
+            moteur_gauche(dc_transl);
+            moteur_droite(dc_transl); // Envoyer -dc pour rotation
+        }
+        if (ordre[0] == 1){
+            regul(dc);
+            moteur_gauche(dc[0]);
+            moteur_droite(dc[1]); // Envoyer -dc pour rotation
+        }
+    }
+    return 0;*/
+    
+    //while (U1STAbits.URXDA) {U1RXREG;}
+    while(1) {
+        _LATB8 = 0;
+        if(U1STAbits.URXDA){
+            ordre = U1RXREG;
+            while (U1STAbits.URXDA) {}
+            param = U1RXREG;
+            regul(dc);
+            moteur_gauche(dc[0]);
+            moteur_droite(dc[1]); // Changer dc[0] par dc[1] pour tourner dans autre sens
+            _LATB8 = 1;
+            __delay_ms(delay);
+            }
+    }
+    return 0;
+}
+
+// L'impression qu'il ne vide pas le registre car diode ne s'allume plus après x répétitions du signal 
+// Communication entre les 2 fonctionne
+
+void moteur_gauche(float dc){
+    if (dc > 0){
+        _LATB13 = 0;
+    }
+    else{
+        dc = -dc;
+        _LATB13 = 1;
+    }
+    OC1RS = dc*(Period+1);
+}
+
+void moteur_droite(float dc){
+    if (dc > 0){
+        _LATB2 = 0;
+    }
+    else{
+        dc = -dc;
+         _LATB2 = 1;
+    }
+    OC2RS = dc*(Period+1);
+}
+
+void regul(float* dc){
+    float distance[2] = {0,0};
+    float consigne_transl = 0; // Distance de consigne
+    float err_transl;
+    float distance_tot;
+    float dc_transl;
+    float err_rotat;
+    float angle_tot;
+    float dc_rotat;
+    float angle[2] = {0,0};
+    float consigne_rot = 0;
+    float dc_somme; 
+    float dc_diff;
+    distance[0] = (2*pi*r*(int)POS1CNT)/1440; // Calcul de la distance de la roue gauche [m]
+    distance[1] = (2*pi*r*(int)POS2CNT)/1440; // Calcul de la distance de la roue droite [m]
+    distance_tot = (distance[0]+distance[1])/2;
+    err_transl = consigne_transl - distance_tot;
+    dc_transl = err_transl*kp;
+    if (dc_transl > 0.4){
+        dc_transl = 0.4;
+    }
+    if (dc_transl < -0.4){
+        dc_transl = -0.4;
+    }
+    angle[0] = (2*pi*(int)POS1CNT)/1440; // Calcul de l'angle de la roue gauche [m]
+    angle[1] = (2*pi*(int)POS2CNT)/1440; // Calcul de l'angle de la roue droite [m]
+    angle_tot = r*(angle[0]-angle[1])/E;
+    err_rotat = consigne_rot-angle_tot;
+    dc_rotat = err_rotat*kp;
+    if (dc_rotat > 0.3){
+        dc_rotat = 0.3;
+    }
+    if (dc_rotat < -0.3){
+        dc_rotat = -0.3;
+    }
+    dc_somme = dc_transl + dc_rotat;
+    dc_diff = dc_transl - dc_rotat;
+    dc[0] = dc_somme;
+    dc[1] = dc_diff;
+}
+
+/*float regul_transl(int*ordre){
+    float distance[2] = {0,0};
+    float consigne_transl = 1.5; // Distance de consigne
+    float err;
+    float distance_tot;
+    float dc;
+    distance[0] = (2*pi*r*(int)POS1CNT)/1440; // Calcul de la distance de la roue gauche [m]
+    distance[1] = (2*pi*r*(int)POS2CNT)/1440; // Calcul de la distance de la roue droite [m]
+    distance_tot = (distance[0]+distance[1])/2;
+    err = consigne_transl - distance_tot;
+    dc = err*kp;
+    if (dc > 0.6){
+        dc = 0.6;
+    }
+    if (dc < -0.6){
+        dc = -0.6;
+    }
+    if (dc < 0.06){
+        ordre[0] = 1;
+        POS1CNT = 0;
+        POS2CNT = 0;  
+        OC1RS = 0;
+        OC2RS = 0;
+        __delay_ms(delay);
+    }
+    return dc;
+}*/
+
+float regul_rotat(){
+    float err;
+    float angle_tot;
+    float dc;
+    float angle[2] = {0,0};
+    float consigne_rot = 2*pi;
+    angle[0] = (2*pi*(int)POS1CNT)/1440; // Calcul de l'angle de la roue gauche [m]
+    angle[1] = (2*pi*(int)POS2CNT)/1440; // Calcul de l'angle de la roue droite [m]
+    angle_tot = r*(angle[0]-angle[1])/E;
+    err = consigne_rot-angle_tot;
+    dc = err*kp;
+    if (dc > 0.3){
+        dc = 0.3;
+    }
+    if (dc < -0.3){
+        dc = -0.3;
+    }
+    /*if (dc < 0.06){
+        ordre[0] = 1;
+        POS1CNT = 0;
+        POS2CNT = 0;  
+        OC1RS = 0;
+        OC2RS = 0;
+        __delay_ms(delay);
+        
+    }*/
+    return dc;
+}
